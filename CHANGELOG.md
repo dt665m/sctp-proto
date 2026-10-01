@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Measure timed reliability from when a message is queued and drop expired unsent messages before they are assigned a TSN (RFC 3758 §4.1)
   * Allow configurable SCTP source and destination ports when connecting #64
   * Accept INIT chunks containing Supported Address Types #63
 

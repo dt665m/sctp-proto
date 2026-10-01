@@ -450,3 +450,168 @@ fn fragment_retry_limits_and_lost_forward_recovery() {
         }
     }
 }
+
+/// Runs `a -> b` with a 50 ms one-way delay, dropping DATA that `drop_data`
+/// selects. Returns every DATA transmission by `a` as (millisecond, TSN) and
+/// the messages `b` read.
+fn run_timed(
+    a: &mut Peer,
+    b: &mut Peer,
+    millis: u64,
+    mut write: impl FnMut(u64, &mut Peer),
+    mut drop_data: impl FnMut(u64) -> bool,
+) -> (Vec<(u64, u32)>, Vec<Vec<u8>>) {
+    use std::collections::VecDeque;
+    let base = Instant::now();
+    let mut ab = VecDeque::<(u64, Bytes)>::new();
+    let mut ba = VecDeque::<(u64, Bytes)>::new();
+    let mut tsns = Vec::new();
+    let mut messages = Vec::new();
+    for ms in 0..millis {
+        let now = base + Duration::from_millis(ms);
+        a.assoc.handle_timeout(now);
+        b.assoc.handle_timeout(now);
+        write(ms, a);
+        while ab.front().is_some_and(|(due, _)| *due <= ms) {
+            let (_, packet) = ab.pop_front().unwrap();
+            b.receive(now, a.addr, packet);
+        }
+        for packet in b.drain(now) {
+            ba.push_back((ms + 50, packet));
+        }
+        messages.extend(b.messages());
+        while ba.front().is_some_and(|(due, _)| *due <= ms) {
+            let (_, packet) = ba.pop_front().unwrap();
+            a.receive(now, b.addr, packet);
+        }
+        for packet in a.drain(now) {
+            let types = chunks(&packet);
+            let data: Vec<u32> = types
+                .iter()
+                .filter(|(ty, _)| *ty == 0)
+                .map(|(_, tsn)| tsn.unwrap())
+                .collect();
+            tsns.extend(data.iter().map(|tsn| (ms, *tsn)));
+            if data.is_empty() || !drop_data(ms) {
+                ab.push_back((ms + 50, packet));
+            }
+        }
+    }
+    (tsns, messages)
+}
+
+#[test]
+fn timed_lifetime_expires_messages_queued_behind_the_congestion_window() {
+    for unordered in [false, true] {
+        let (mut a, mut b) = pairs(ReliabilityType::Timed);
+        a.assoc
+            .stream(0)
+            .unwrap()
+            .set_reliability_params(unordered, ReliabilityType::Timed, 100)
+            .unwrap();
+        // Far more than the initial congestion window can carry, and all of
+        // the first flight is lost, so the window cannot open before the
+        // queued messages expire.
+        let (tsns, messages) = run_timed(
+            &mut a,
+            &mut b,
+            5000,
+            |ms, a| {
+                let mut stream = a.assoc.stream(0).unwrap();
+                if ms == 0 {
+                    for _ in 0..40 {
+                        stream.write(&[7; 1000]).unwrap();
+                    }
+                } else if ms == 150 {
+                    stream.write(b"fresh").unwrap();
+                }
+            },
+            |ms| ms < 150,
+        );
+        let distinct = |sent: &mut dyn Iterator<Item = u32>| {
+            let mut sent: Vec<u32> = sent.collect();
+            sent.sort_unstable();
+            sent.dedup();
+            sent.len()
+        };
+        let first_flight = distinct(&mut tsns.iter().filter(|(ms, _)| *ms < 150).map(|t| t.1));
+        assert!(first_flight < 40, "the window must hold messages back");
+        assert_eq!(
+            distinct(&mut tsns.iter().map(|t| t.1)),
+            first_flight + 1,
+            "expired unsent messages must never be assigned a TSN (unordered={unordered})"
+        );
+        assert_eq!(
+            messages,
+            vec![b"fresh".to_vec()],
+            "the next message must not wait for expired ones (unordered={unordered})"
+        );
+        assert_eq!(a.assoc.stream(0).unwrap().buffered_amount().unwrap(), 0);
+    }
+}
+
+#[test]
+fn timed_lifetime_keeps_queued_messages_that_are_still_alive() {
+    for unordered in [false, true] {
+        let (mut a, mut b) = pairs(ReliabilityType::Timed);
+        a.assoc
+            .stream(0)
+            .unwrap()
+            .set_reliability_params(unordered, ReliabilityType::Timed, 10_000)
+            .unwrap();
+        let (_, messages) = run_timed(
+            &mut a,
+            &mut b,
+            5000,
+            |ms, a| {
+                if ms == 0 {
+                    let mut stream = a.assoc.stream(0).unwrap();
+                    for i in 0..40u8 {
+                        stream.write(&[i; 1000]).unwrap();
+                    }
+                }
+            },
+            |_| false,
+        );
+        let mut firsts: Vec<u8> = messages.iter().map(|m| m[0]).collect();
+        if unordered {
+            firsts.sort_unstable();
+        }
+        assert_eq!(firsts, (0..40).collect::<Vec<_>>(), "unordered={unordered}");
+    }
+}
+
+#[test]
+fn timed_lifetime_is_fixed_when_the_message_is_queued() {
+    let (mut a, mut b) = pairs(ReliabilityType::Timed);
+    a.assoc
+        .stream(0)
+        .unwrap()
+        .set_reliability_params(true, ReliabilityType::Timed, 100)
+        .unwrap();
+    let (tsns, messages) = run_timed(
+        &mut a,
+        &mut b,
+        // Past the initial 3 s RTO, so the first message reaches retransmission.
+        10_000,
+        |ms, a| {
+            let mut stream = a.assoc.stream(0).unwrap();
+            if ms == 0 {
+                stream.write(b"short lived").unwrap();
+                // A later change must not extend what was already queued.
+                stream
+                    .set_reliability_params(true, ReliabilityType::Timed, 60_000)
+                    .unwrap();
+            } else if ms == 400 {
+                stream.write(b"long lived").unwrap();
+            }
+        },
+        |ms| ms < 400,
+    );
+    let first = tsns[0].1;
+    assert!(
+        tsns.iter().all(|(ms, tsn)| *tsn != first || *ms < 400),
+        "the first message must be abandoned after its original 100 ms lifetime"
+    );
+    assert_eq!(messages, vec![b"long lived".to_vec()]);
+}

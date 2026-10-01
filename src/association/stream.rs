@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bytes::Bytes;
 use core::fmt;
+use core::time::Duration;
 use log::{debug, error, trace};
 
 /// Identifier for a stream within a particular association
@@ -539,6 +540,11 @@ impl StreamState {
 
         let mut chunks = vec![];
 
+        // RFC 3758 TR6: the lifetime is fixed when the message is passed to SCTP.
+        let lifetime = (ppi != PayloadProtocolIdentifier::Dcep
+            && self.reliability_type == ReliabilityType::Timed)
+            .then(|| Duration::from_millis(u64::from(self.reliability_value)));
+
         let message_state = alloc::sync::Arc::default();
         while remaining != 0 {
             // self.association.max_payload_size
@@ -558,6 +564,7 @@ impl StreamState {
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
                 message_state: Some(alloc::sync::Arc::clone(&message_state)),
+                lifetime,
                 ..Default::default()
             };
 

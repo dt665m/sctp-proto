@@ -2,6 +2,7 @@ use super::{chunk_header::*, chunk_type::*, *};
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
+use core::time::Duration;
 use std::time::Instant;
 
 pub(crate) const ABANDONED: u8 = 1;
@@ -109,6 +110,12 @@ pub struct ChunkPayloadData {
 
     /// Partial-reliability parameters used only by sender
     pub(crate) since: Option<Instant>,
+    /// Timed reliability lifetime, fixed when the message was handed to SCTP
+    /// (RFC 3758 TR6).
+    pub(crate) lifetime: Option<Duration>,
+    /// When `lifetime` runs out. It is measured from when the message was
+    /// queued, not first sent, so unsent messages expire too (RFC 3758 §4.1).
+    pub(crate) expires_at: Option<Instant>,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
@@ -135,6 +142,8 @@ impl Default for ChunkPayloadData {
             acked: false,
             miss_indicator: 0,
             since: None,
+            lifetime: None,
+            expires_at: None,
             nsent: 0,
             message_state: None,
             retransmit: false,
@@ -212,6 +221,8 @@ impl Chunk for ChunkPayloadData {
             acked: false,
             miss_indicator: 0,
             since: None,
+            lifetime: None,
+            expires_at: None,
             nsent: 0,
             message_state: None,
             retransmit: false,
@@ -260,6 +271,12 @@ impl ChunkPayloadData {
         self.message_state
             .get_or_insert_with(Default::default)
             .fetch_or(ABANDONED, Ordering::Relaxed);
+    }
+
+    /// The lifetime includes its last instant, so a lifetime of zero still
+    /// lets the message be sent when it is queued, as in dcSCTP.
+    pub(crate) fn expired(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|at| now > at)
     }
 
     pub(crate) fn set_all_inflight(&mut self) {

@@ -1,6 +1,8 @@
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use std::time::Instant;
 
 /// pendingBaseQueue
 pub(crate) type PendingBaseQueue = VecDeque<ChunkPayloadData>;
@@ -12,6 +14,8 @@ pub(crate) struct PendingQueue {
     ordered_queue: PendingBaseQueue,
     queue_len: usize,
     n_bytes: usize,
+    /// Queued chunks that carry a timed-reliability lifetime.
+    n_timed: usize,
     selected: bool,
     unordered_is_selected: bool,
 }
@@ -23,6 +27,7 @@ impl PendingQueue {
 
     pub(crate) fn push(&mut self, c: ChunkPayloadData) {
         self.n_bytes += c.user_data.len();
+        self.n_timed += usize::from(c.lifetime.is_some());
         if c.unordered {
             self.unordered_queue.push_back(c);
         } else {
@@ -93,10 +98,74 @@ impl PendingQueue {
 
         if let Some(p) = &popped {
             self.n_bytes -= p.user_data.len();
+            self.n_timed -= usize::from(p.lifetime.is_some());
             self.queue_len -= 1;
         }
 
         popped
+    }
+
+    /// Starts the lifetime of newly queued timed messages and removes every
+    /// message whose lifetime ran out before any of its fragments received a
+    /// TSN (RFC 3758 §4.1 and TR3). A partially sent message cannot be removed
+    /// here: it is marked abandoned so its unsent tail is discarded and
+    /// FORWARD-TSN covers the sent prefix.
+    ///
+    /// An ordered message never sent leaves no gap in its stream: messages
+    /// queued behind it take over its stream sequence number, as if it had
+    /// never been queued. The removed chunks are returned so the caller can
+    /// release their buffer credit and stream sequence numbers.
+    pub(crate) fn remove_expired(&mut self, now: Instant) -> Vec<ChunkPayloadData> {
+        let mut removed = Vec::new();
+        if self.n_timed == 0 {
+            return removed;
+        }
+        for unordered in [true, false] {
+            let mut sending = self.selected && self.unordered_is_selected == unordered;
+            let mut expired = false;
+            // (stream, ordered messages removed so far) for the SSN shift.
+            let mut shifts: Vec<(u16, u16)> = Vec::new();
+            let queue = if unordered {
+                &mut self.unordered_queue
+            } else {
+                &mut self.ordered_queue
+            };
+            queue.retain_mut(|c| {
+                if let Some(lifetime) = c.lifetime {
+                    c.expires_at.get_or_insert(now + lifetime);
+                }
+                if sending {
+                    sending = !c.ending_fragment;
+                    if c.expired(now) {
+                        c.abandon();
+                    }
+                    return true;
+                }
+                if c.beginning_fragment {
+                    expired = c.expired(now);
+                    if expired && !unordered {
+                        match shifts.iter_mut().find(|(id, _)| *id == c.stream_identifier) {
+                            Some((_, n)) => *n = n.wrapping_add(1),
+                            None => shifts.push((c.stream_identifier, 1)),
+                        }
+                    }
+                }
+                if expired {
+                    removed.push(c.clone());
+                    return false;
+                }
+                if let Some((_, n)) = shifts.iter().find(|(id, _)| *id == c.stream_identifier) {
+                    c.stream_sequence_number = c.stream_sequence_number.wrapping_sub(*n);
+                }
+                true
+            });
+        }
+        for c in &removed {
+            self.n_bytes -= c.user_data.len();
+            self.n_timed -= usize::from(c.lifetime.is_some());
+            self.queue_len -= 1;
+        }
+        removed
     }
 
     pub(crate) fn get_num_bytes(&self) -> usize {

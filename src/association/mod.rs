@@ -3935,7 +3935,38 @@ impl Association {
 
     /// pop_pending_data_chunks_to_send pops chunks from the pending queues as many as
     /// the cwnd and rwnd allows to send.
+    /// RFC 3758 TR3: a timed message whose lifetime ran out before it was
+    /// first sent is dropped without being assigned a TSN, so no FORWARD-TSN
+    /// is needed for it. A partially sent message is abandoned instead and its
+    /// tail is discarded by `discard_abandoned_pending_fragments`.
+    fn remove_expired_pending_messages(&mut self, now: Instant) {
+        if !self.use_forward_tsn {
+            return;
+        }
+        for c in self.pending_queue.remove_expired(now) {
+            if let Some(stream) = self.streams.get_mut(&c.stream_identifier) {
+                if !c.unordered && c.beginning_fragment {
+                    stream.sequence_number = stream.sequence_number.wrapping_sub(1);
+                }
+                if stream.on_buffer_released(c.user_data.len() as i64) {
+                    self.events
+                        .push_back(Event::Stream(StreamEvent::BufferedAmountLow {
+                            id: c.stream_identifier,
+                        }));
+                }
+            }
+            trace!(
+                "[{}] dropped expired unsent message: si={} ssn={} len={}",
+                self.side,
+                c.stream_identifier,
+                c.stream_sequence_number,
+                c.user_data.len()
+            );
+        }
+    }
+
     fn pop_pending_data_chunks_to_send(&mut self, now: Instant) -> Vec<ChunkPayloadData> {
+        self.remove_expired_pending_messages(now);
         self.discard_abandoned_pending_fragments();
         let mut chunks = vec![];
         if !self.pending_queue.is_empty() {
@@ -4071,19 +4102,14 @@ impl Association {
                         side, c.tsn, c.payload_type, c.nsent
                     );
                 }
-            } else if reliability_type == ReliabilityType::Timed {
-                if let Some(since) = &c.since {
-                    let elapsed = now.duration_since(*since);
-                    if elapsed.as_millis() as u32 >= reliability_value {
-                        c.abandon();
-                        trace!(
-                            "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
-                            side, c.tsn, c.payload_type, elapsed
-                        );
-                    }
-                } else {
-                    error!("[{}] invalid c.since", side);
-                }
+            } else if c.expired(now) {
+                // RFC 3758 TR4: evaluate the lifetime fixed when the message
+                // was queued (TR6) before every retransmission.
+                c.abandon();
+                trace!(
+                    "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
+                    side, c.tsn, c.payload_type, c.lifetime
+                );
             }
         } else {
             error!("[{}] stream {} not found)", side, c.stream_identifier);
